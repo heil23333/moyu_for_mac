@@ -656,6 +656,28 @@ class MoYuPdfViewer(QMainWindow):
         if path:
             self._load_pdf(path)
 
+    def _goto_page(self):
+        """跳转到指定页（输入 1~N，滚动到该页顶部）"""
+        if not self._placeholders:
+            return
+        total = len(self._placeholders)
+        value, ok = QInputDialog.getInt(
+            self, "跳转到指定页",
+            f"输入页码（1 ~ {total}）:",
+            1, 1, total, 1
+        )
+        if not ok:
+            return
+        ph = self._placeholders[value - 1]
+        # 目标滚动值 = 当前滚动值 + 页顶相对视口的偏移（mapTo 已包含所有
+        # 布局平移；这个公式与 setWidgetResizable/边距无关，永远精确）
+        bar = self.scroll_area.verticalScrollBar()
+        target = bar.value() + ph.mapTo(self.scroll_area.viewport(), QPoint(0, 0)).y()
+        target = max(0, min(target, bar.maximum()))
+        bar.setValue(target)
+        # 立即触发渲染（不等防抖窗口）
+        self._on_scroll()
+
     def _load_pdf(self, path: str):
         """加载 PDF（异步）：后台读元数据 → 建占位符 → 按需懒加载"""
         # 旧 meta worker 若仍在运行：取消 + 转入退休列表，绝不裸覆盖引用
@@ -986,8 +1008,9 @@ class MoYuPdfViewer(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet(self._make_menu_style())
 
-        # 打开 / 最近
+        # 打开 / 跳转 / 最近
         menu.addAction("📂 打开 PDF", self._open_file)
+        menu.addAction("📄 跳转到指定页…", self._goto_page)
         recent_menu = menu.addMenu("📜 最近打开")
         if self._recent_files:
             for r in self._recent_files[:10]:
@@ -1165,6 +1188,9 @@ class MoYuPdfViewer(QMainWindow):
         if self._pre_hide_pos is not None:
             self.move(self._pre_hide_pos)
         if self._pre_hide_size is not None:
+            # 必须先解除 setFixedSize 的尺寸约束（否则 resize 被限制在 36x36 无效）
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
             self.resize(self._pre_hide_size)
         self.setWindowOpacity(self._opacity)
         self._is_hidden_mode = False
