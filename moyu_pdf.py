@@ -63,8 +63,8 @@ class ViewerConfig:
 # ─────────────────────────────────────────────
 
 class PdfPageRenderWorker(QThread):
-    """按需渲染指定页面；裁剪 + 缩放也在子线程完成，只把最终显示图发回主线程"""
-    page_rendered = Signal(int, QPixmap, QPixmap)   # page_index, raw_pixmap, display_pixmap
+    """按需渲染指定页面；子线程全程使用线程安全的 QImage（QPixmap 只能在主线程操作）"""
+    page_rendered = Signal(int, QImage, QImage, QRect)  # page_index, raw_image, display_image, crop_rect
     render_error = Signal(int, str)
 
     def __init__(self, pdf_path: str, page_index: int, dpi: int = 150,
@@ -84,22 +84,26 @@ class PdfPageRenderWorker(QThread):
             mat = pymupdf.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             fmt = QImage.Format.Format_RGB888
-            qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
-            raw_pixmap = QPixmap.fromImage(qimg)
+            raw_image = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
+            # 深拷贝：pix 内存属于 pymupdf，doc.close() 后失效（QImage 默认是浅拷贝）
+            raw_image = raw_image.copy()
             doc.close()
 
-            # ── 子线程内完成裁剪 + 缩放（不再阻塞主线程）──
+            crop_rect = QRect(0, 0, raw_image.width(), raw_image.height())
+            cropped = raw_image
             if self.crop_enabled:
-                rect = PageCropper.detect_content_rect(raw_pixmap)
-                cropped = raw_pixmap.copy(rect)
-            else:
-                cropped = raw_pixmap
+                crop_rect = PageCropper.detect_content_rect_image(raw_image)
+                cropped = raw_image.copy(crop_rect)
 
-            display = cropped.scaledToWidth(
-                self.target_width, Qt.TransformationMode.SmoothTransformation
+            # 在子线程用 QImage 缩放（线程安全）
+            display = cropped.scaled(
+                self.target_width,
+                max(1, int(cropped.height() * self.target_width / max(cropped.width(), 1))),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
             )
 
-            self.page_rendered.emit(self.page_index, raw_pixmap, display)
+            self.page_rendered.emit(self.page_index, raw_image, display, crop_rect)
         except Exception as e:
             self.render_error.emit(self.page_index, str(e))
 
@@ -144,36 +148,74 @@ class PdfMetaWorker(QThread):
 class PageCropper:
     @staticmethod
     def detect_content_rect(pixmap: QPixmap, threshold: int = 245) -> QRect:
+        """QImage 专用检测（线程安全版本）"""
         if pixmap.isNull():
             return QRect(0, 0, pixmap.width(), pixmap.height())
+        return PageCropper.detect_content_rect_image(pixmap.toImage(), threshold)
 
-        image = pixmap.toImage()
+    @staticmethod
+    def detect_content_rect_image(image: QImage, threshold: int = 245) -> QRect:
+        """基于 QImage 的裁剪检测（可在子线程调用，不依赖 QPixmap）。
+
+        注意：不用 pixelColor()——它在子线程每次都分配 QColor 临时对象，
+        开销大且有跨线程风险。这里直接用 constBits() 原始字节扫描
+        （RGB888，每像素 3 字节），速度快一个量级且零 Qt 对象分配。
+        """
         w, h = image.width(), image.height()
+        if w <= 0 or h <= 0:
+            return QRect(0, 0, w, h)
+
+        if image.format() != QImage.Format.Format_RGB888:
+            image = image.convertToFormat(QImage.Format.Format_RGB888)
+            w, h = image.width(), image.height()
+
+        bpl = image.bytesPerLine()
+        mv = memoryview(image.constBits())
         top, bottom, left, right = 0, h, 0, w
 
+        # 上边
         for y in range(h):
+            row = y * bpl
+            found = False
             for x in range(0, w, 3):
-                if image.pixelColor(x, y).lightness() < threshold:
-                    top = y; break
-            if top > 0: break
+                o = row + x * 3
+                if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
+                    top = y; found = True; break
+            if found:
+                break
 
+        # 下边
         for y in range(h - 1, -1, -1):
+            row = y * bpl
+            found = False
             for x in range(0, w, 3):
-                if image.pixelColor(x, y).lightness() < threshold:
-                    bottom = y; break
-            if bottom < h - 1: break
+                o = row + x * 3
+                if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
+                    bottom = y; found = True; break
+            if found:
+                break
 
+        # 左边
         for x in range(w):
+            col = x * 3
+            found = False
             for y in range(0, h, 3):
-                if image.pixelColor(x, y).lightness() < threshold:
-                    left = x; break
-            if left > 0: break
+                o = y * bpl + col
+                if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
+                    left = x; found = True; break
+            if found:
+                break
 
+        # 右边
         for x in range(w - 1, -1, -1):
+            col = x * 3
+            found = False
             for y in range(0, h, 3):
-                if image.pixelColor(x, y).lightness() < threshold:
-                    right = x; break
-            if right < w - 1: break
+                o = y * bpl + col
+                if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
+                    right = x; found = True; break
+            if found:
+                break
 
         margin = 15
         left = max(0, left - margin)
@@ -239,15 +281,26 @@ class PagePlaceholder(QWidget):
         painter.end()
 
     def set_rendered(self, pixmap: QPixmap, crop_enabled: bool = True,
-                     display_pixmap: Optional[QPixmap] = None):
-        """渲染完成后更新显示；display_pixmap 由渲染线程预缩放，传入则不再主线程缩放大图"""
-        self.raw_pixmap = pixmap
-        if crop_enabled:
-            rect = PageCropper.detect_content_rect(pixmap)
-            self.cropped_pixmap = pixmap.copy(rect)
-        else:
-            self.cropped_pixmap = pixmap
-        self.is_rendered = True
+                     display_pixmap: Optional[QPixmap] = None,
+                     crop_rect: Optional[QRect] = None):
+        """渲染完成后更新显示；display_pixmap/crop_rect 由渲染线程预计算，不再主线程重复扫描"""
+        try:
+            self.raw_pixmap = pixmap
+            if crop_enabled:
+                if crop_rect is not None:
+                    # 子线程已算好裁剪区域（避免主线程重复检测）
+                    self.cropped_pixmap = pixmap.copy(crop_rect)
+                else:
+                    rect = PageCropper.detect_content_rect(pixmap)
+                    self.cropped_pixmap = pixmap.copy(rect)
+            else:
+                self.cropped_pixmap = pixmap
+            self.is_rendered = True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"[set_rendered 异常] 页 {self.page_index}: {e}")
+            return
 
         if display_pixmap is not None:
             # 渲染线程已经算好（含裁剪+缩放）→ 直接用
@@ -362,6 +415,7 @@ class MoYuPdfViewer(QMainWindow):
         self._active_workers: dict[int, PdfPageRenderWorker] = {}
         self._render_queue: list[int] = []            # 等待渲染的页号（按优先级）
         self._retired_workers: list[PdfPageRenderWorker] = []  # 已过期但仍在跑的线程（防 GC 销毁崩溃）
+        self._retired_meta: list[PdfMetaWorker] = []          # 已过期但仍在跑的元数据线程（防 GC 销毁崩溃）
         self._MAX_CONCURRENT: int = 3                 # 同时最多 3 个渲染线程
         self._last_visible_range: tuple[int, int] = (-1, -1)
         self._meta_worker: Optional[PdfMetaWorker] = None
@@ -371,13 +425,6 @@ class MoYuPdfViewer(QMainWindow):
         self._scroll_timer.setSingleShot(True)
         self._scroll_timer.setInterval(80)  # 80ms 内只处理最后一次滚动
         self._scroll_timer.timeout.connect(self._process_scroll)
-        self._scroll_pending = False
-
-        # 滚动防抖：快速滚动时合并事件，避免主线程被高频遍历/排序打爆
-        self._scroll_debounce: QTimer = QTimer(self)
-        self._scroll_debounce.setSingleShot(True)
-        self._scroll_debounce.setInterval(80)  # 80ms 内只处理最后一次滚动
-        self._scroll_debounce.timeout.connect(self._process_scroll)
         self._scroll_pending = False
 
         self.setAcceptDrops(True)
@@ -563,16 +610,17 @@ class MoYuPdfViewer(QMainWindow):
 
     def closeEvent(self, event):
         self._save_state()
-        # 优雅退出：等待仍在渲染的线程结束，避免 QThread destroyed 警告
-        for worker in list(self._active_workers.values()):
-            if worker and worker.isRunning():
-                worker.wait(2000)  # 最多等 2 秒
-        self._active_workers.clear()
-        # 退休线程（可能仍在跑）也要等待
+        # 优雅退出：先安全释放活跃 worker（转入退休列表），再统一等待所有线程结束
+        self._retire_all()
         for worker in list(self._retired_workers):
             if worker and worker.isRunning():
-                worker.wait(2000)
+                worker.wait(2000)  # 最多等 2 秒
         self._retired_workers.clear()
+        # 退休的元数据线程也一起等待
+        for worker in list(self._retired_meta):
+            if worker and worker.isRunning():
+                worker.wait(2000)
+        self._retired_meta.clear()
         if self._meta_worker and self._meta_worker.isRunning():
             self._meta_worker.cancel()
             self._meta_worker.wait(2000)
@@ -610,10 +658,21 @@ class MoYuPdfViewer(QMainWindow):
 
     def _load_pdf(self, path: str):
         """加载 PDF（异步）：后台读元数据 → 建占位符 → 按需懒加载"""
-        if self._meta_worker and self._meta_worker.isRunning():
-            self._meta_worker.cancel()
+        # 旧 meta worker 若仍在运行：取消 + 转入退休列表，绝不裸覆盖引用
+        # （裸覆盖会让 GC 销毁运行中的 QThread → SIGABRT 崩溃）
+        if self._meta_worker is not None:
+            old = self._meta_worker
+            if old.isRunning():
+                old.cancel()
+                if old not in self._retired_meta:
+                    self._retired_meta.append(old)
+                    old.finished.connect(
+                        lambda ww=old: self._retire_meta_done(ww)
+                    )
+            self._meta_worker = None
 
-        self._active_workers.clear()
+        # 安全释放渲染线程：同样原则，绝不裸 clear()
+        self._retire_all()
 
         self.pdf_path = path
         self._record_recent(path)
@@ -634,6 +693,9 @@ class MoYuPdfViewer(QMainWindow):
             return
 
         self.total_pages = total
+
+        # 重置可见范围缓存，否则切换文件后首次滚动会被误判为“无变化”而跳过渲染
+        self._last_visible_range = (-1, -1)
 
         self._clear_pages()
         self._placeholders.clear()
@@ -737,10 +799,8 @@ class MoYuPdfViewer(QMainWindow):
         stale_workers = [i for i in self._active_workers if i < range_start or i > range_end]
         for i in stale_workers:
             w = self._active_workers.pop(i, None)
-            if w and w.isRunning():
-                # 线程可能还在跑：放进退休列表保持引用，防止 GC 直接销毁运行中的线程导致崩溃退出
-                self._retired_workers.append(w)
-                w.finished.connect(lambda ww=w: self._retire_done(ww))
+            # 线程可能还在跑：统一走退休流程（保持引用等 finished 信号，防 GC 销毁运行中线程崩溃）
+            self._retire_worker(w)
 
         # 入队：可见范围内的未渲染页面（去重 + 按距离优先级）
         for i in range(range_start, range_end + 1):
@@ -760,11 +820,43 @@ class MoYuPdfViewer(QMainWindow):
                 if (i < range_start - 5 or i > range_end + 5) and ph.is_rendered:
                     ph.clear_pixmap()
 
+    def _retire_worker(self, worker: Optional[PdfPageRenderWorker]):
+        """安全释放单个 worker：若仍在运行则转入退休列表，等 finished 信号后再回收。
+
+        关键：绝对不能直接丢引用让 GC 销毁运行中的 QThread（→ Qt qFatal SIGABRT）。
+        """
+        if worker is None:
+            return
+        # 竞态兜底：连接 finished 之前线程可能已结束，此时无需进退休列表
+        if worker.isFinished():
+            return
+        if worker.isRunning():
+            if worker not in self._retired_workers:
+                self._retired_workers.append(worker)
+                worker.finished.connect(
+                    lambda ww=worker: self._retire_done(ww)
+                )
+        # 不运行则不保留（允许立即回收）
+
+    def _retire_all(self):
+        """安全释放所有活跃 worker（加载新 PDF/关闭窗口时调用）"""
+        for worker in list(self._active_workers.values()):
+            self._retire_worker(worker)
+        self._active_workers.clear()
+
     def _retire_done(self, worker):
         """退休线程结束：从退休列表移除引用（允许 GC 清理）"""
         try:
             if worker in self._retired_workers:
                 self._retired_workers.remove(worker)
+        except ValueError:
+            pass
+
+    def _retire_meta_done(self, worker):
+        """退休的元数据线程结束：从列表移除引用（允许 GC 清理）"""
+        try:
+            if worker in self._retired_meta:
+                self._retired_meta.remove(worker)
         except ValueError:
             pass
 
@@ -792,7 +884,8 @@ class MoYuPdfViewer(QMainWindow):
         )
         worker.path = self.pdf_path  # 供回调校验来源
         worker.page_rendered.connect(
-            lambda idx, raw, disp, p=worker.pdf_path: self._on_page_rendered(p, idx, raw, disp)
+            lambda idx, raw, disp, crop_rect, p=worker.pdf_path:
+                self._on_page_rendered(p, idx, raw, disp, crop_rect)
         )
         worker.render_error.connect(
             lambda idx, err, p=worker.pdf_path: self._on_render_error(p, idx, err)
@@ -800,28 +893,32 @@ class MoYuPdfViewer(QMainWindow):
         self._active_workers[page_index] = worker
         worker.start()
 
-    def _on_page_rendered(self, path: str, page_index: int, raw_pixmap: QPixmap,
-                         display_pixmap: QPixmap):
-        """渲染完成回调（校验是否已过期；直接使用线程算好的显示图）"""
+    def _on_page_rendered(self, path: str, page_index: int, raw_image: QImage,
+                         display_image: QImage, crop_rect: QRect):
+        """渲染完成回调（主线程执行）：把线程安全的 QImage 转成 QPixmap 再显示"""
         if path != self.pdf_path:
-            self._active_workers.pop(page_index, None)
+            self._retire_worker(self._active_workers.pop(page_index, None))
             return
         if page_index >= len(self._placeholders):
-            self._active_workers.pop(page_index, None)
+            self._retire_worker(self._active_workers.pop(page_index, None))
             return
 
         ph = self._placeholders[page_index]
 
-        # 快速滚动竞态保护：该页已被滚动清理（clear_pixmap 把 is_rendered 置 False）
-        # 此时应用过期渲染结果会显示错乱 → 跳过
-        if not ph.is_rendered and ph.raw_pixmap is None and ph.display_pixmap is None:
-            # 页面处于骨架状态且结果来自过期滚动：直接丢弃，等下次 _process_scroll 重新入队
-            self._active_workers.pop(page_index, None)
+        # 竞态保护（修正版）：worker 若已被滚动清理（移出活跃列表），
+        # 其渲染结果属于过期滚动 → 丢弃，等 _process_scroll 重新入队。
+        # 注意：不能用「页面是骨架状态」判断——初次渲染时页面本来就是骨架，
+        # 那样会把第一次渲染结果也误丢弃（页面永不显示）。
+        if page_index not in self._active_workers:
             self._pump_render_queue()
             return
 
-        ph.set_rendered(raw_pixmap, self._crop_enabled, display_pixmap)
-        self._active_workers.pop(page_index, None)
+        # ── QImage → QPixmap 转换必须在主线程（macOS 上子线程创建 QPixmap 会崩溃）──
+        raw_pixmap = QPixmap.fromImage(raw_image)
+        display_pixmap = QPixmap.fromImage(display_image)
+        ph.set_rendered(raw_pixmap, self._crop_enabled, display_pixmap, crop_rect)
+        # worker 可能仍在收尾：统一走退休流程，防 GC 销毁运行中线程
+        self._retire_worker(self._active_workers.pop(page_index, None))
 
         self._pump_render_queue()   # 有空位 → 继续派发排队页
 
@@ -836,7 +933,8 @@ class MoYuPdfViewer(QMainWindow):
     def _on_render_error(self, path: str, page_index: int, error: str):
         if path != self.pdf_path:
             return
-        self._active_workers.pop(page_index, None)
+        # worker 可能仍在收尾：统一走退休流程，防 GC 销毁运行中线程
+        self._retire_worker(self._active_workers.pop(page_index, None))
 
     # ── 功能操作 ──
 
