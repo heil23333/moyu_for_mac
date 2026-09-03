@@ -25,7 +25,8 @@ from typing import Optional
 import pymupdf  # PyMuPDF 新版 API（fitz 已弃用）
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFileDialog, QMenu, QSizePolicy, QScrollArea, QInputDialog
+    QLabel, QFileDialog, QMenu, QSizePolicy, QScrollArea, QInputDialog,
+    QSpinBox, QFrame
 )
 from PySide6.QtCore import (
     Qt, QTimer, QPoint, QRect, QSize, QThread, Signal, QRectF
@@ -68,13 +69,17 @@ class PdfPageRenderWorker(QThread):
     render_error = Signal(int, str)
 
     def __init__(self, pdf_path: str, page_index: int, dpi: int = 150,
-                 crop_enabled: bool = True, target_width: int = 480):
+                 crop_enabled: bool = True, target_width: int = 480,
+                 crop_margins: Optional[list[int]] = None):
         super().__init__()
         self.pdf_path = pdf_path
         self.page_index = page_index
         self.dpi = dpi
         self.crop_enabled = crop_enabled
         self.target_width = target_width
+        # crop_margins = [top, left, right, bottom]：由当前可见页检测一次得到，
+        # 直接按四边距算裁剪矩形，不再逐页调 detect_content_rect_image。
+        self.crop_margins = crop_margins or [0, 0, 0, 0]
 
     def run(self):
         try:
@@ -89,11 +94,16 @@ class PdfPageRenderWorker(QThread):
             raw_image = raw_image.copy()
             doc.close()
 
-            crop_rect = QRect(0, 0, raw_image.width(), raw_image.height())
+            w, h = raw_image.width(), raw_image.height()
+            crop_rect = QRect(0, 0, w, h)
             cropped = raw_image
-            if self.crop_enabled:
-                crop_rect = PageCropper.detect_content_rect_image(raw_image)
-                cropped = raw_image.copy(crop_rect)
+            if self.crop_enabled and any(self.crop_margins):
+                # 按四边距裁剪；边距由主窗口检测一次，存 settings 持久化
+                top, left, right, bottom = self.crop_margins
+                crop_rect = QRect(left, top, max(0, w - left - right), max(0, h - top - bottom))
+                if crop_rect.width() > 0 and crop_rect.height() > 0:
+                    cropped = raw_image.copy(crop_rect)
+            # 若 crop_enabled 但 crop_margins 全零（刚开启还没检测）：不裁剪，等检测完重渲染
 
             # 在子线程用 QImage 缩放（线程安全）
             display = cropped.scaled(
@@ -229,6 +239,177 @@ class PageCropper:
 
 
 # ─────────────────────────────────────────────
+# 手动裁剪交互层
+# ─────────────────────────────────────────────
+
+class CropOverlay(QWidget):
+    """手动裁剪交互层：半透明遮罩 + 拖拽框选矩形。
+
+    覆盖在滚动视口上，左键拖拽画选区，松开（选区 ≥10px）自动确认；
+    Esc / 右键取消；Enter 确认当前选区。
+    confirmed 信号带视口坐标的选区 QRect；cancelled 信号表示取消。
+    """
+
+    confirmed = Signal(QRect)   # 视口坐标的选区
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._drag_start: Optional[QPoint] = None
+        self._sel: Optional[QRect] = None
+
+    def begin(self):
+        """显示并抢占焦点（键盘 Esc/Enter 生效）"""
+        self._drag_start = None
+        self._sel = None
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # 整层半透明遮罩（底下的 PDF 隐约可见）
+        p.fillRect(self.rect(), QColor(16, 24, 40, 110))
+        if self._sel is not None and not self._sel.isEmpty():
+            sel = self._sel.normalized().intersected(self.rect())
+            if not sel.isEmpty():
+                # 选区内恢复透明（差集画法）
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+                p.fillRect(sel, QColor(0, 0, 0, 255))
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+                # 边框 + 尺寸标注
+                p.setPen(QPen(QColor("#3498DB"), 2))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(sel)
+                from PySide6.QtGui import QFont
+                f = QFont()
+                f.setPointSize(11)
+                f.setBold(True)
+                p.setFont(f)
+                p.setPen(QColor("#FFFFFF"))
+                label = f"{sel.width()} × {sel.height()}"
+                lx = sel.x()
+                ly = sel.y() - 6
+                if ly < 6:
+                    ly = sel.y() + 6
+                p.drawText(QPoint(lx, ly), label)
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = e.position().toPoint()
+            self._sel = None
+            self.update()
+            e.accept()
+        elif e.button() == Qt.MouseButton.RightButton:
+            self.cancelled.emit()
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._drag_start is not None:
+            self._sel = QRect(self._drag_start, e.position().toPoint())
+            self.update()
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
+            self._sel = QRect(self._drag_start, e.position().toPoint()).normalized()
+            self._drag_start = None
+            if self._sel.width() >= 10 and self._sel.height() >= 10:
+                self.confirmed.emit(self._sel)   # 松开即确认
+            else:
+                self._sel = None                 # 太小视为误触，清除
+                self.update()
+            e.accept()
+        else:
+            super().mouseReleaseEvent(e)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape:
+            self.cancelled.emit()
+            e.accept()
+        elif e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._sel is not None and not self._sel.isEmpty():
+                self.confirmed.emit(self._sel.normalized())
+            e.accept()
+        else:
+            super().keyPressEvent(e)
+
+
+# ─────────────────────────────────────────────
+# 边距调整面板
+# ─────────────────────────────────────────────
+
+class CropMarginPanel(QWidget):
+    """显示并编辑当前裁剪四边距的小面板（悬浮在窗口底部）。
+
+    四个 SpinBox 对应 上/下/左/右，数值变化时通过 callback 实时应用。
+    """
+
+    def __init__(self, parent=None, on_apply=None):
+        super().__init__(parent)
+        self._on_apply = on_apply  # callback(margins: list[int])
+        self.setStyleSheet("""
+            QFrame {
+                background: rgba(30, 30, 30, 220);
+                border-radius: 8px;
+                padding: 4px 8px;
+            }
+            QLabel { color: #FFFFFF; font-size: 11px; }
+            QSpinBox {
+                background: #3A3A3A; color: #FFFFFF; border: 1px solid #555;
+                border-radius: 4px; padding: 2px 4px; font-size: 12px; width: 44px;
+            }
+            QSpinBox:focus { border-color: #3498DB; }
+        """)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        self._spins: dict[str, QSpinBox] = {}
+        for label_text in ["上", "下", "左", "右"]:
+            lbl = QLabel(label_text)
+            spin = QSpinBox()
+            spin.setRange(0, 999)
+            spin.setSingleStep(1)
+            spin.valueChanged.connect(self._on_value_changed)
+            self._spins[label_text] = spin
+            layout.addWidget(lbl)
+            layout.addWidget(spin)
+        self.hide()
+
+    def set_margins(self, margins: list[int]):
+        """更新面板数值（外部调用，不触发回调）"""
+        top, left, right, bottom = margins if len(margins) >= 4 else [0, 0, 0, 0]
+        # 阻塞信号避免循环触发
+        for s in self._spins.values():
+            s.blockSignals(True)
+        self._spins["上"].setValue(top)
+        self._spins["下"].setValue(bottom)
+        self._spins["左"].setValue(left)
+        self._spins["右"].setValue(right)
+        for s in self._spins.values():
+            s.blockSignals(False)
+
+    def _on_value_changed(self, _):
+        if self._on_apply:
+            margins = [
+                self._spins["上"].value(),
+                self._spins["左"].value(),
+                self._spins["右"].value(),
+                self._spins["下"].value(),
+            ]
+            self._on_apply(margins)
+
+
+# ─────────────────────────────────────────────
 # 页面占位 Widget（懒加载骨架）
 # ─────────────────────────────────────────────
 
@@ -245,6 +426,8 @@ class PagePlaceholder(QWidget):
         self.cropped_pixmap: Optional[QPixmap] = None
         self.display_pixmap: Optional[QPixmap] = None  # 预缩放后的显示图（渲染线程算好）
         self.is_rendered = False
+        self.crop_rect: Optional[QRect] = None   # 最近一次有效裁剪区域（手动裁剪恢复用）
+        self.manual_cropped = False              # 当前是否被手动裁剪（显示的是局部区域）
 
         self.setFixedHeight(PLACEHOLDER_HEIGHT)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -293,9 +476,15 @@ class PagePlaceholder(QWidget):
                 else:
                     rect = PageCropper.detect_content_rect(pixmap)
                     self.cropped_pixmap = pixmap.copy(rect)
+                self.crop_rect = crop_rect or rect  # 记录裁剪区域（自动/手动都记）
             else:
                 self.cropped_pixmap = pixmap
+                self.crop_rect = None  # 无裁剪
             self.is_rendered = True
+            # 只有标准渲染（crop_enabled=True，即自动裁白边）才重置 manual_cropped；
+            # crop_enabled=False（手动裁剪路径）时不动——由 _apply_manual_crop 显式管理
+            if crop_enabled:
+                self.manual_cropped = False
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -385,7 +574,9 @@ class MoYuPdfViewer(QMainWindow):
         # 加载设置
         saved = load_settings()
         self._opacity = saved.get("opacity", self.config.default_opacity)
-        self._crop_enabled = saved.get("crop_enabled", True)
+        # 裁剪模式："off" / "auto" / "manual"（三态切换）
+        old_crop = saved.get("crop_enabled", True)
+        self._crop_mode: str = "auto" if old_crop else "off"  # 兼容旧设置（bool→三态）
         self._is_top = saved.get("is_top", True)
         self._scroll_sensitivity = saved.get("scroll_sensitivity", 3)  # 1~10 灵敏度
         self._recent_files: list[dict] = saved.get("recent_files", [])
@@ -417,6 +608,13 @@ class MoYuPdfViewer(QMainWindow):
         self._retired_workers: list[PdfPageRenderWorker] = []  # 已过期但仍在跑的线程（防 GC 销毁崩溃）
         self._retired_meta: list[PdfMetaWorker] = []          # 已过期但仍在跑的元数据线程（防 GC 销毁崩溃）
         self._MAX_CONCURRENT: int = 3                 # 同时最多 3 个渲染线程
+        # 手动裁剪状态
+        self._manual_crop_active = False              # 当前是否在手动裁剪交互中
+        self._manual_crop_page: Optional[int] = None # 被手动裁剪的页码（用于恢复）
+        self._manual_crop_orig = None                 # (display_pixmap, crop_rect) 该页裁剪前的原始显示
+        self._crop_overlay: Optional[CropOverlay] = None
+        # 自动裁剪边距 [top, left, right, bottom]（由当前可见页检测得出，存入 settings 持久化）
+        self._crop_margins: list[int] = [0, 0, 0, 0]
         self._last_visible_range: tuple[int, int] = (-1, -1)
         self._meta_worker: Optional[PdfMetaWorker] = None
 
@@ -511,6 +709,10 @@ class MoYuPdfViewer(QMainWindow):
         main_layout.addWidget(self.scroll_area)
         main_layout.addWidget(self.progress_label)
 
+        # 边距调整面板（悬浮在窗口底部，裁剪模式非 off 时显示）
+        self._crop_margin_panel = CropMarginPanel(self, on_apply=self._on_margin_panel_apply)
+        self._position_crop_panel()
+
         self.setCentralWidget(self.container)
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -536,14 +738,16 @@ class MoYuPdfViewer(QMainWindow):
         super().resizeEvent(event)
         if not self._is_hidden_mode:
             self._apply_rounded_mask()
+        if self._crop_margin_panel.isVisible():
+            self._position_crop_panel()
 
     def _setup_shortcuts(self):
         shortcuts = {
             "Ctrl+O": self._open_file,
-            "Ctrl+C": self._toggle_crop,
+            "Ctrl+C": self._cycle_crop_mode,
             "Ctrl+T": self._toggle_top,
             "Ctrl+Q": self.close,
-            "Escape": self.close,
+            "Escape": self._hide_to_menubar,  # Esc 最小化（小图标），不是退出
             "Ctrl+=": lambda: self._adjust_opacity(5),
             "Ctrl+-": lambda: self._adjust_opacity(-5),
             "Ctrl+0": lambda: self._set_opacity(100),
@@ -592,9 +796,15 @@ class MoYuPdfViewer(QMainWindow):
             self._set_scroll_sensitivity(val)
 
     def _save_state(self):
+        # 将当前文件的裁剪边距写入 recent_files 对应条目
+        if self.pdf_path and self._crop_margins != [0, 0, 0, 0]:
+            for r in self._recent_files:
+                if r.get("path") == self.pdf_path:
+                    r["crop_margins"] = self._crop_margins
+                    break
         settings = {
             "opacity": self._opacity,
-            "crop_enabled": self._crop_enabled,
+            "crop_mode": self._crop_mode,  # "off" / "auto" / "manual"
             "is_top": self._is_top,
             "scroll_sensitivity": self._scroll_sensitivity,
             "recent_files": self._recent_files,
@@ -695,6 +905,19 @@ class MoYuPdfViewer(QMainWindow):
 
         # 安全释放渲染线程：同样原则，绝不裸 clear()
         self._retire_all()
+
+        # 重置手动裁剪状态（切换文件后旧裁剪无效）
+        self._manual_crop_active = False
+        self._manual_crop_page = None
+        self._manual_crop_orig = None
+        if self._crop_overlay:
+            self._crop_overlay.hide()
+        # 恢复该文件的裁剪边距（从历史记录；无则全零，由 _detect_auto_margins 时填入）
+        self._crop_margins = [0, 0, 0, 0]
+        for r in self._recent_files:
+            if r.get("path") == path:
+                self._crop_margins = r.get("crop_margins", [0, 0, 0, 0])
+                break
 
         self.pdf_path = path
         self._record_recent(path)
@@ -901,8 +1124,9 @@ class MoYuPdfViewer(QMainWindow):
         worker = PdfPageRenderWorker(
             self.pdf_path, page_index,
             dpi=self.config.render_dpi,
-            crop_enabled=self._crop_enabled,
+            crop_enabled=self._crop_mode != "off",
             target_width=target_width,
+            crop_margins=self._crop_margins,  # 左右边距，由 _detect_auto_margins 检测一次，存 settings 持久化
         )
         worker.path = self.pdf_path  # 供回调校验来源
         worker.page_rendered.connect(
@@ -938,7 +1162,8 @@ class MoYuPdfViewer(QMainWindow):
         # ── QImage → QPixmap 转换必须在主线程（macOS 上子线程创建 QPixmap 会崩溃）──
         raw_pixmap = QPixmap.fromImage(raw_image)
         display_pixmap = QPixmap.fromImage(display_image)
-        ph.set_rendered(raw_pixmap, self._crop_enabled, display_pixmap, crop_rect)
+        ph.set_rendered(raw_pixmap, self._crop_mode != "off", display_pixmap, crop_rect)
+
         # worker 可能仍在收尾：统一走退休流程，防 GC 销毁运行中线程
         self._retire_worker(self._active_workers.pop(page_index, None))
 
@@ -960,11 +1185,102 @@ class MoYuPdfViewer(QMainWindow):
 
     # ── 功能操作 ──
 
-    def _toggle_crop(self):
-        self._crop_enabled = not self._crop_enabled
-        for i, ph in enumerate(self._placeholders):
-            if ph.is_rendered and ph.raw_pixmap:
-                ph.set_rendered(ph.raw_pixmap, self._crop_enabled)
+    def _set_crop_mode(self, mode: str):
+        """切换裁剪模式：off / auto / manual；重复点击当前模式触发重新操作"""
+        # 先清理当前模式状态（manual 需要恢复被裁页）
+        if self._crop_mode == "manual" and mode != "manual":
+            self._cancel_manual_crop()
+        # 设置新模式
+        self._crop_mode = mode
+        if mode == "auto":
+            self._detect_auto_margins()    # 已是 auto 时再点 = 用当前页重新检测
+        elif mode == "manual":
+            self._start_manual_crop()       # 已是 manual 时再点 = 重新框选
+        elif mode == "off":
+            self._clear_crop_and_rerender() # 已是 off 时再点 = 无操作
+        # 面板显示/隐藏
+        if mode != "off":
+            self._crop_margin_panel.set_margins(self._crop_margins)
+            self._crop_margin_panel.show()
+            self._position_crop_panel()
+        else:
+            self._crop_margin_panel.hide()
+
+    def _cycle_crop_mode(self):
+        """快捷键 Ctrl+C 循环：关 → 自动 → 手动 → 关"""
+        order = {"off": "auto", "auto": "manual", "manual": "off"}
+        self._set_crop_mode(order.get(self._crop_mode, "off"))
+
+    def _detect_auto_margins(self):
+        """自动检测当前可见页的左右白边，得到固定边距，所有页统一应用"""
+        if not self.pdf_path or not self._placeholders:
+            self._crop_mode = "off"
+            return
+        # 找当前可见第一个已渲染页
+        ref_ph = None
+        vp = self.scroll_area.viewport()
+        for ph in self._placeholders:
+            pos = ph.mapTo(vp, QPoint(0, 0))
+            if 0 <= pos.y() < vp.height() and ph.is_rendered and ph.raw_pixmap is not None:
+                ref_ph = ph
+                break
+        if ref_ph is None:
+            self._crop_mode = "off"
+            return
+        raw = ref_ph.raw_pixmap
+        rect = PageCropper.detect_content_rect(raw)
+        # 四边距：top, left, right, bottom
+        top    = rect.y()
+        left   = rect.x()
+        right  = raw.width()  - rect.x() - rect.width()
+        bottom = raw.height() - rect.y() - rect.height()
+        self._crop_margins = [top, left, right, bottom]
+        # 存入历史记录持久化
+        for r in self._recent_files:
+            if r.get("path") == self.pdf_path:
+                r["crop_margins"] = self._crop_margins
+                break
+        # 用检测区域刷新当前页
+        ref_ph.set_rendered(raw, True, None, rect)
+        # 其余页：清除 pixmap 重新渲染
+        for ph in self._placeholders:
+            if ph is not ref_ph and ph.is_rendered:
+                ph.clear_pixmap()
+        self._last_visible_range = (-1, -1)
+        QTimer.singleShot(50, self._on_scroll)
+
+    def _clear_crop_and_rerender(self):
+        """关闭裁剪：清零边距，清除所有页 pixmap，重新渲染"""
+        self._crop_margins = [0, 0, 0, 0]
+        for ph in self._placeholders:
+            if ph.is_rendered:
+                ph.clear_pixmap()
+        self._last_visible_range = (-1, -1)
+        QTimer.singleShot(50, self._on_scroll)
+
+    def _position_crop_panel(self):
+        """把边距面板定位到窗口底部居中"""
+        pw = self._crop_margin_panel.width() or 200
+        ph = self._crop_margin_panel.height() or 28
+        x = (self.width() - pw) // 2
+        y = self.height() - ph - 6
+        self._crop_margin_panel.move(x, y)
+
+    def _on_margin_panel_apply(self, margins: list[int]):
+        """面板 SpinBox 数值变化时实时应用新边距"""
+        self._crop_margins = margins
+        # 存入历史记录持久化
+        if self.pdf_path:
+            for r in self._recent_files:
+                if r.get("path") == self.pdf_path:
+                    r["crop_margins"] = self._crop_margins
+                    break
+        # 清除所有页 pixmap，重新渲染
+        for ph in self._placeholders:
+            if ph.is_rendered:
+                ph.clear_pixmap()
+        self._last_visible_range = (-1, -1)
+        QTimer.singleShot(50, self._on_scroll)
 
     def _toggle_top(self):
         self._is_top = not self._is_top
@@ -975,6 +1291,90 @@ class MoYuPdfViewer(QMainWindow):
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.show()
+
+    # ── 手动裁剪 ──
+
+    def _start_manual_crop(self):
+        """进入/退出手动裁剪模式：若已在裁剪则取消；否则在视口上叠加 CropOverlay 进行框选"""
+        if not self.pdf_path or not self._placeholders:
+            return
+        # 若已激活手动裁剪（正在裁或已裁过）→ 取消并恢复
+        if self._manual_crop_active or self._manual_crop_page is not None:
+            self._cancel_manual_crop()
+            return
+        vp = self.scroll_area.viewport()
+        if self._crop_overlay is None:
+            self._crop_overlay = CropOverlay(vp)
+            self._crop_overlay.confirmed.connect(self._apply_manual_crop)
+            self._crop_overlay.cancelled.connect(self._cancel_manual_crop)
+        # 覆盖整个视口，十字光标
+        self._crop_overlay.setGeometry(vp.rect())
+        self._crop_overlay.begin()
+        self._manual_crop_active = True
+        # 隐藏滚动条防误操作，记光标
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def _apply_manual_crop(self, sel: QRect):
+        """应用手动裁剪：把视口选区映射到视口内中心页并裁剪该页"""
+        vp = self.scroll_area.viewport()
+        # 找选区中心所在的占位符页（最准确）
+        center = sel.center()
+        target_ph = None
+        for ph in self._placeholders:
+            pos = ph.mapTo(vp, QPoint(0, 0))
+            if pos.y() <= center.y() <= pos.y() + ph.height():
+                target_ph = ph
+                break
+        # 若找不到（罕见）就取视口最上方的页
+        if target_ph is None:
+            for ph in self._placeholders:
+                pos = ph.mapTo(vp, QPoint(0, 0))
+                if pos.y() + ph.height() >= 0 and pos.y() < vp.height():
+                    target_ph = ph
+                    break
+        if target_ph is None or not target_ph.is_rendered or target_ph.display_pixmap is None:
+            self._finish_manual_crop()
+            return
+        # 首次对该页手动裁剪：保存原始状态（仅保存一次，多次裁剪只保留首次的原始）
+        if self._manual_crop_page != target_ph.page_index:
+            self._manual_crop_page = target_ph.page_index
+            self._manual_crop_orig = (target_ph.display_pixmap, target_ph.crop_rect)
+        # 换算视口选区到该页的局部坐标（display_pixmap 尺寸与 placeholder 一致）
+        ph_pos = target_ph.mapTo(vp, QPoint(0, 0))
+        local = QRect(sel.x() - ph_pos.x(), sel.y() - ph_pos.y(), sel.width(), sel.height())
+        local = local.intersected(QRect(0, 0, target_ph.display_pixmap.width(), target_ph.display_pixmap.height()))
+        if local.width() < 5 or local.height() < 5:
+            self._finish_manual_crop()
+            return
+        cropped = target_ph.display_pixmap.copy(local)
+        if cropped.isNull():
+            self._finish_manual_crop()
+            return
+        # 应用到该页：crop_enabled=False 使用提供的 display_pixmap
+        target_ph.manual_cropped = True
+        target_ph.set_rendered(target_ph.raw_pixmap, False, cropped, None)
+        self._finish_manual_crop()
+
+    def _finish_manual_crop(self):
+        """结束交互（overlay 隐藏，滚动条恢复）但保持手动裁剪状态（菜单显示开）"""
+        if self._crop_overlay:
+            self._crop_overlay.hide()
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.unsetCursor()
+
+    def _cancel_manual_crop(self):
+        """取消手动裁剪并恢复被裁页为原始显示"""
+        self._finish_manual_crop()
+        if self._manual_crop_page is not None and self._manual_crop_page < len(self._placeholders):
+            ph = self._placeholders[self._manual_crop_page]
+            if ph.manual_cropped and self._manual_crop_orig is not None:
+                orig_display, orig_crop = self._manual_crop_orig
+                ph.manual_cropped = False
+                # 恢复原始显示：crop_enabled=True + 原始 crop_rect（自动或全页）
+                ph.set_rendered(ph.raw_pixmap, True, orig_display, orig_crop)
+        self._manual_crop_active = False
+        self._manual_crop_page = None
+        self._manual_crop_orig = None
 
     def _make_menu_style(self) -> str:
         return f"""
@@ -1030,9 +1430,15 @@ class MoYuPdfViewer(QMainWindow):
 
         menu.addSeparator()
 
-        # 裁剪 / 置顶
-        crop_state = "开" if self._crop_enabled else "关"
-        menu.addAction(f"✂️ 裁剪: {crop_state}", self._toggle_crop)
+        # 裁剪白边（三个独立选项）
+        crop_menu = menu.addMenu("✂️ 裁剪白边")
+        for mode, label in [("off", "关闭"), ("auto", "自动检测"), ("manual", "手动裁切")]:
+            check = "  ✓" if self._crop_mode == mode else ""
+            crop_menu.addAction(
+                f"{label}{check}",
+                lambda m=mode: self._set_crop_mode(m)
+            )
+        # 置顶
         top_state = "开" if self._is_top else "关"
         menu.addAction(f"📌 置顶: {top_state}", self._toggle_top)
 
