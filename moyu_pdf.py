@@ -59,6 +59,9 @@ class ViewerConfig:
     hover_color: str = "#E8F4FD"
 
 
+PLACEHOLDER_HEIGHT = 600  # 初始占位高度，渲染后替换为实际高度
+
+
 # ─────────────────────────────────────────────
 # PDF 单页渲染线程
 # ─────────────────────────────────────────────
@@ -137,6 +140,7 @@ class PdfMetaWorker(QThread):
             total = len(doc)
             page_heights = []
             # 每页尺寸读取也可能耗时，逐页但可取消
+            # PLACEHOLDER_HEIGHT 作为初始占位高度，按宽高比推算
             for i in range(total):
                 if self._cancel:
                     doc.close()
@@ -144,7 +148,7 @@ class PdfMetaWorker(QThread):
                 page = doc[i]
                 rect = page.rect
                 aspect = rect.height / rect.width
-                page_heights.append(int(480 * aspect))
+                page_heights.append(int(PLACEHOLDER_HEIGHT * aspect))
             doc.close()
             self.meta_loaded.emit(total, page_heights)
         except Exception as e:
@@ -158,7 +162,7 @@ class PdfMetaWorker(QThread):
 class PageCropper:
     @staticmethod
     def detect_content_rect(pixmap: QPixmap, threshold: int = 245) -> QRect:
-        """QImage 专用检测（线程安全版本）"""
+        """主线程版本：接收 QPixmap，内部转 QImage 检测（子线程请用 detect_content_rect_image）"""
         if pixmap.isNull():
             return QRect(0, 0, pixmap.width(), pixmap.height())
         return PageCropper.detect_content_rect_image(pixmap.toImage(), threshold)
@@ -187,7 +191,7 @@ class PageCropper:
         for y in range(h):
             row = y * bpl
             found = False
-            for x in range(0, w, 3):
+            for x in range(0, w):
                 o = row + x * 3
                 if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
                     top = y; found = True; break
@@ -198,7 +202,7 @@ class PageCropper:
         for y in range(h - 1, -1, -1):
             row = y * bpl
             found = False
-            for x in range(0, w, 3):
+            for x in range(0, w):
                 o = row + x * 3
                 if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
                     bottom = y; found = True; break
@@ -209,7 +213,7 @@ class PageCropper:
         for x in range(w):
             col = x * 3
             found = False
-            for y in range(0, h, 3):
+            for y in range(0, h):
                 o = y * bpl + col
                 if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
                     left = x; found = True; break
@@ -220,7 +224,7 @@ class PageCropper:
         for x in range(w - 1, -1, -1):
             col = x * 3
             found = False
-            for y in range(0, h, 3):
+            for y in range(0, h):
                 o = y * bpl + col
                 if max(mv[o], mv[o + 1], mv[o + 2]) < threshold:
                     right = x; found = True; break
@@ -260,6 +264,10 @@ class CropOverlay(QWidget):
         self.setCursor(Qt.CursorShape.CrossCursor)
         self._drag_start: Optional[QPoint] = None
         self._sel: Optional[QRect] = None
+        # 预创建字体（避免每次 paintEvent 重复创建）
+        self._label_font = QFont()
+        self._label_font.setPointSize(11)
+        self._label_font.setBold(True)
 
     def begin(self):
         """显示并抢占焦点（键盘 Esc/Enter 生效）"""
@@ -286,11 +294,7 @@ class CropOverlay(QWidget):
                 p.setPen(QPen(QColor("#3498DB"), 2))
                 p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(sel)
-                from PySide6.QtGui import QFont
-                f = QFont()
-                f.setPointSize(11)
-                f.setBold(True)
-                p.setFont(f)
+                p.setFont(self._label_font)
                 p.setPen(QColor("#FFFFFF"))
                 label = f"{sel.width()} × {sel.height()}"
                 lx = sel.x()
@@ -412,8 +416,6 @@ class CropMarginPanel(QWidget):
 # ─────────────────────────────────────────────
 # 页面占位 Widget（懒加载骨架）
 # ─────────────────────────────────────────────
-
-PLACEHOLDER_HEIGHT = 600  # 初始占位高度，渲染后替换为实际高度
 
 class PagePlaceholder(QWidget):
     """页面占位符 — 渲染前显示，渲染后替换为实际内容"""
@@ -575,8 +577,7 @@ class MoYuPdfViewer(QMainWindow):
         saved = load_settings()
         self._opacity = saved.get("opacity", self.config.default_opacity)
         # 裁剪模式："off" / "auto" / "manual"（三态切换）
-        old_crop = saved.get("crop_enabled", True)
-        self._crop_mode: str = "auto" if old_crop else "off"  # 兼容旧设置（bool→三态）
+        self._crop_mode: str = saved.get("crop_mode", "auto")  # 恢复上次保存的模式
         self._is_top = saved.get("is_top", True)
         self._scroll_sensitivity = saved.get("scroll_sensitivity", 3)  # 1~10 灵敏度
         self._recent_files: list[dict] = saved.get("recent_files", [])
@@ -597,6 +598,7 @@ class MoYuPdfViewer(QMainWindow):
         self.total_pages: int = 0
         self.worker: Optional[PdfPageRenderWorker] = None
         self._drag_pos: Optional[QPoint] = None
+        self._hide_click_pos: Optional[QPoint] = None
         self._is_hidden_mode = False
         self._pre_hide_pos: Optional[QPoint] = None
         self._pre_hide_size: Optional[QSize] = None
@@ -625,21 +627,24 @@ class MoYuPdfViewer(QMainWindow):
         self._scroll_timer.timeout.connect(self._process_scroll)
         self._scroll_pending = False
 
+        # 边距面板防抖：快速调节 SpinBox 时避免疯狂重渲染
+        self._margin_timer: QTimer = QTimer(self)
+        self._margin_timer.setSingleShot(True)
+        self._margin_timer.setInterval(200)
+        self._margin_timer.timeout.connect(self._apply_pending_margins)
+
         self.setAcceptDrops(True)
         self.setMouseTracking(True)
 
         self._setup_ui()
         self._setup_shortcuts()
 
-        # 恢复窗口
+        # 恢复窗口尺寸和位置
         if last_size:
             self.resize(last_size[0], last_size[1])
-        else:
-            self._center_window()
-
         if last_pos:
             self.move(last_pos[0], last_pos[1])
-        else:
+        if not last_size and not last_pos:
             self._center_window()
 
         self._apply_rounded_mask()
@@ -695,6 +700,7 @@ class MoYuPdfViewer(QMainWindow):
 
         # 内容区域
         self.content_area = QWidget()
+        self.content_area.setStyleSheet(f"background-color: {self.config.bg_color};")
         self.content_layout = QVBoxLayout(self.content_area)
         self.content_layout.setContentsMargins(8, 8, 8, 8)
         self.content_layout.setSpacing(2)
@@ -796,8 +802,8 @@ class MoYuPdfViewer(QMainWindow):
             self._set_scroll_sensitivity(val)
 
     def _save_state(self):
-        # 将当前文件的裁剪边距写入 recent_files 对应条目
-        if self.pdf_path and self._crop_margins != [0, 0, 0, 0]:
+        # 始终将当前文件的裁剪边距写入 recent_files（即使全零也要写，否则关闭裁剪后下次还会恢复旧值）
+        if self.pdf_path:
             for r in self._recent_files:
                 if r.get("path") == self.pdf_path:
                     r["crop_margins"] = self._crop_margins
@@ -837,17 +843,20 @@ class MoYuPdfViewer(QMainWindow):
         super().closeEvent(event)
 
     def _record_recent(self, path: str):
-        old_pos = 0
+        old_entry = {}
         for r in self._recent_files:
             if r.get("path") == path:
-                old_pos = r.get("position", 0) or 0
+                old_entry = r
                 break
         entry = {
             "path": path,
             "name": Path(path).stem,
             "time": time.strftime("%Y-%m-%d %H:%M"),
-            "position": old_pos,
+            "position": old_entry.get("position", 0) or 0,
         }
+        # 保留旧条目的 crop_margins（不丢失）
+        if "crop_margins" in old_entry:
+            entry["crop_margins"] = old_entry["crop_margins"]
         self._recent_files = [e for e in self._recent_files if e.get("path") != path]
         self._recent_files.insert(0, entry)
         self._recent_files = self._recent_files[:20]
@@ -921,6 +930,9 @@ class MoYuPdfViewer(QMainWindow):
 
         self.pdf_path = path
         self._record_recent(path)
+
+        # 重置滚动条到顶部（切换文件后不继承旧文件的滚动位置）
+        self.scroll_area.verticalScrollBar().setValue(0)
 
         self.progress_label.show()
         self.progress_label.setText("⏳ 正在读取 PDF 信息…")
@@ -1193,11 +1205,12 @@ class MoYuPdfViewer(QMainWindow):
         # 设置新模式
         self._crop_mode = mode
         if mode == "auto":
-            self._detect_auto_margins()    # 已是 auto 时再点 = 用当前页重新检测
+            self._detect_auto_margins()
+            # 检测失败（无已渲染页）时保持 auto 模式不变，等页面渲染完后可再次触发
         elif mode == "manual":
-            self._start_manual_crop()       # 已是 manual 时再点 = 重新框选
+            self._start_manual_crop()
         elif mode == "off":
-            self._clear_crop_and_rerender() # 已是 off 时再点 = 无操作
+            self._clear_crop_and_rerender()
         # 面板显示/隐藏
         if mode != "off":
             self._crop_margin_panel.set_margins(self._crop_margins)
@@ -1214,7 +1227,6 @@ class MoYuPdfViewer(QMainWindow):
     def _detect_auto_margins(self):
         """自动检测当前可见页的左右白边，得到固定边距，所有页统一应用"""
         if not self.pdf_path or not self._placeholders:
-            self._crop_mode = "off"
             return
         # 找当前可见第一个已渲染页
         ref_ph = None
@@ -1225,7 +1237,8 @@ class MoYuPdfViewer(QMainWindow):
                 ref_ph = ph
                 break
         if ref_ph is None:
-            self._crop_mode = "off"
+            # 页面还在渲染中，等 500ms 后重试一次
+            QTimer.singleShot(500, self._detect_auto_margins)
             return
         raw = ref_ph.raw_pixmap
         rect = PageCropper.detect_content_rect(raw)
@@ -1267,7 +1280,7 @@ class MoYuPdfViewer(QMainWindow):
         self._crop_margin_panel.move(x, y)
 
     def _on_margin_panel_apply(self, margins: list[int]):
-        """面板 SpinBox 数值变化时实时应用新边距"""
+        """面板 SpinBox 数值变化时：存边距 + 启动防抖（200ms 后才真正重渲染）"""
         self._crop_margins = margins
         # 存入历史记录持久化
         if self.pdf_path:
@@ -1275,7 +1288,10 @@ class MoYuPdfViewer(QMainWindow):
                 if r.get("path") == self.pdf_path:
                     r["crop_margins"] = self._crop_margins
                     break
-        # 清除所有页 pixmap，重新渲染
+        self._margin_timer.start()  # 200ms 防抖窗口
+
+    def _apply_pending_margins(self):
+        """防抖后真正重渲染：清除所有页 pixmap，用最新边距重新渲染"""
         for ph in self._placeholders:
             if ph.is_rendered:
                 ph.clear_pixmap()
@@ -1468,7 +1484,8 @@ class MoYuPdfViewer(QMainWindow):
             ("Ctrl+O", "打开 PDF"),
             ("Ctrl+C", "切换裁剪"),
             ("Ctrl+T", "切换置顶"),
-            ("Ctrl+Q / Esc", "退出"),
+            ("Ctrl+Q", "退出"),
+            ("Esc", "最小化"),
             ("Ctrl++ / Ctrl+-", "透明度 +5 / -5"),
             ("Ctrl+0", "透明度恢复 100%"),
             ("Ctrl+↑ / Ctrl↓", "透明度 +5 / -5"),
@@ -1569,8 +1586,9 @@ class MoYuPdfViewer(QMainWindow):
 
         self._pre_hide_pos = self.pos()
         self._pre_hide_size = self.size()
+        self._pre_hide_crop_mode = self._crop_mode  # 保存裁剪模式（恢复时还原）
 
-        # 隐藏内容（避免小图标被内容遮挡）
+        # 隐藏所有子 widget（不用 setCentralWidget(None)，避免 Qt 销毁 container）
         self.container.hide()
 
         icon_size = 36
@@ -1590,7 +1608,7 @@ class MoYuPdfViewer(QMainWindow):
         self.update()
 
     def _restore_from_menubar(self):
-        """从隐藏状态恢复：还原大小、位置、透明度"""
+        """从隐藏状态恢复：还原大小、位置、透明度、裁剪模式"""
         if self._pre_hide_pos is not None:
             self.move(self._pre_hide_pos)
         if self._pre_hide_size is not None:
@@ -1600,6 +1618,18 @@ class MoYuPdfViewer(QMainWindow):
             self.resize(self._pre_hide_size)
         self.setWindowOpacity(self._opacity)
         self._is_hidden_mode = False
+
+        # 恢复裁剪模式（最小化前的状态）
+        saved_crop = getattr(self, '_pre_hide_crop_mode', None)
+        if saved_crop and saved_crop != self._crop_mode:
+            self._crop_mode = saved_crop
+            # 恢复面板显示
+            if self._crop_mode != "off":
+                self._crop_margin_panel.set_margins(self._crop_margins)
+                self._crop_margin_panel.show()
+                self._position_crop_panel()
+            else:
+                self._crop_margin_panel.hide()
 
         self.container.show()
         self.clearMask()
@@ -1613,6 +1643,9 @@ class MoYuPdfViewer(QMainWindow):
             painter.setRenderHint(QPainter.RenderHint.Antialiasing)
             rect = self.rect()
 
+            # 先填充背景（覆盖任何子 widget 残留绘制）
+            painter.fillRect(rect, QColor("#2C2C2C"))
+
             # 深灰圆底 + 白色圆角纸片（文档图标）
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor("#3A3A3A"))
@@ -1622,7 +1655,7 @@ class MoYuPdfViewer(QMainWindow):
             painter.setBrush(QColor("#FFFFFF"))
             painter.drawRoundedRect(paper, 3, 3)
 
-            painter.setPen(QPen(QColor("#A0A0A0"), 2))
+            painter.setPen(QPen(QColor("#A0A0A0"), 1.5))
             line_margin = 10
             line_y = paper.y() + 9
             for _ in range(3):
