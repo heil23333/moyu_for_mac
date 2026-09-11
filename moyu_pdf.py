@@ -29,12 +29,12 @@ from PySide6.QtWidgets import (
     QSpinBox, QFrame
 )
 from PySide6.QtCore import (
-    Qt, QTimer, QPoint, QRect, QSize, QThread, Signal, QRectF
+    Qt, QTimer, QPoint, QRect, QSize, QThread, Signal, QRectF, QPointF
 )
 from PySide6.QtGui import (
     QPixmap, QImage, QRegion, QFont, QPainter, QColor, QPen,
     QCursor, QKeySequence, QShortcut, QDragEnterEvent, QDropEvent,
-    QPainterPath
+    QPainterPath, QTransform
 )
 
 
@@ -55,7 +55,7 @@ class ViewerConfig:
     text_color: str = "#2C3E50"
     accent_color: str = "#3498DB"
     secondary_color: str = "#ECF0F1"
-    border_color: str = "#BDC3C7"
+    border_color: str = "#E0E0E0"
     hover_color: str = "#E8F4FD"
 
 
@@ -659,9 +659,8 @@ class MoYuPdfViewer(QMainWindow):
         self.container = QWidget()
         self.container.setStyleSheet(f"""
             QWidget#container {{
-                background-color: {self.config.bg_color};
-                border: 1px solid {self.config.border_color};
-                border-radius: 12px;
+                background-color: transparent;
+                border: none;
             }}
         """)
         self.container.setObjectName("container")
@@ -733,12 +732,53 @@ class MoYuPdfViewer(QMainWindow):
         QTimer.singleShot(50, self._on_scroll)
 
     def _apply_rounded_mask(self):
+        """使用 QPainterPath 实现平滑圆角（抗锯齿）"""
         r = self.rect()
         radius = 12
         path = QPainterPath()
-        path.addRoundedRect(float(r.x()), float(r.y()), float(r.width()), float(r.height()), radius, radius)
-        mask = QRegion(path.toFillPolygon().toPolygon())
-        self.setMask(mask)
+        path.addRoundedRect(QRectF(r), radius, radius)
+        # 使用 path 创建 region（比直接用 QRegion 生成的多边形更平滑）
+        polygon = path.toFillPolygon(QTransform())
+        self.setMask(QRegion(polygon.toPolygon()))
+
+    def paintEvent(self, event):
+        """窗口级绘制：圆角背景 + 隐藏模式图标"""
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        
+        if self._is_hidden_mode:
+            rect = QRectF(self.rect())
+            # 先填充背景
+            painter.fillRect(rect, QColor("#2C2C2C"))
+            # 深灰圆底 + 白色圆角纸片（文档图标）
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor("#3A3A3A"))
+            painter.drawRoundedRect(rect, 8, 8)
+            paper = rect.adjusted(7, 5, -7, -5)
+            painter.setBrush(QColor("#FFFFFF"))
+            painter.drawRoundedRect(paper, 3, 3)
+            painter.setPen(QPen(QColor("#A0A0A0"), 1.5))
+            line_margin = 10
+            line_y = paper.y() + 9
+            for _ in range(3):
+                painter.drawLine(QPointF(paper.x() + line_margin, line_y),
+                                  QPointF(paper.right() - line_margin, line_y))
+                line_y += 6
+        else:
+            # 正常模式：绘制带圆角的背景（实现平滑过渡）
+            rect = QRectF(self.rect())
+            radius = 12.0
+            # 绘制圆角背景
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(self.config.bg_color))
+            painter.drawRoundedRect(rect, radius, radius)
+            # 绘制极淡的边框
+            painter.setPen(QPen(QColor(0, 0, 0, 15), 1.0))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), radius, radius)
+        
+        painter.end()
+        # 不调用 super().paintEvent，完全自定义绘制
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1393,35 +1433,49 @@ class MoYuPdfViewer(QMainWindow):
         self._manual_crop_orig = None
 
     def _make_menu_style(self) -> str:
+        # 计算背景色的alpha值，应用透明度
+        alpha = int(246 * self._opacity)
+        border_alpha = int(20 * self._opacity)
+        separator_alpha = int(15 * self._opacity)
+        disabled_alpha = int(64 * self._opacity)
         return f"""
             QMenu {{
-                background-color: {self.config.bg_color};
-                border: 1px solid {self.config.border_color};
-                border-radius: 10px;
-                padding: 6px;
+                background-color: rgba(246, 246, 246, {alpha});
+                border: 1px solid rgba(0, 0, 0, {border_alpha});
+                border-radius: 8px;
+                padding: 5px 0px;
                 font-size: 13px;
             }}
             QMenu::item {{
-                padding: 7px 24px;
-                border-radius: 6px;
-                color: {self.config.text_color};
+                padding: 5px 24px 5px 16px;
+                border-radius: 4px;
+                margin: 2px 6px;
+                color: #1d1d1f;
             }}
             QMenu::item:selected {{
-                background-color: {self.config.hover_color};
+                background-color: #007AFF;
+                color: white;
             }}
             QMenu::separator {{
                 height: 1px;
-                background: {self.config.secondary_color};
-                margin: 5px 10px;
+                background: rgba(0, 0, 0, {separator_alpha});
+                margin: 4px 12px;
             }}
-            QMenu::submenu-open {{
-                background-color: {self.config.hover_color};
+            QMenu::item:disabled {{
+                color: rgba(0, 0, 0, {disabled_alpha});
+            }}
+            QMenu::item:disabled:selected {{
+                background-color: transparent;
+                color: rgba(0, 0, 0, {disabled_alpha});
             }}
         """
 
     def _show_window_menu(self, pos: QPoint):
         """右键菜单：收纳所有功能（摸鱼隐蔽）"""
         menu = QMenu(self)
+        # macOS 上强制使用自定义样式
+        menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
         menu.setStyleSheet(self._make_menu_style())
 
         # 打开 / 跳转 / 最近
@@ -1636,36 +1690,6 @@ class MoYuPdfViewer(QMainWindow):
         self._apply_rounded_mask()
         self.update()
 
-    def paintEvent(self, event):
-        """窗口级绘制：隐藏模式下绘制小图标"""
-        if self._is_hidden_mode:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-            rect = self.rect()
-
-            # 先填充背景（覆盖任何子 widget 残留绘制）
-            painter.fillRect(rect, QColor("#2C2C2C"))
-
-            # 深灰圆底 + 白色圆角纸片（文档图标）
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#3A3A3A"))
-            painter.drawRoundedRect(rect, 8, 8)
-
-            paper = rect.adjusted(7, 5, -7, -5)
-            painter.setBrush(QColor("#FFFFFF"))
-            painter.drawRoundedRect(paper, 3, 3)
-
-            painter.setPen(QPen(QColor("#A0A0A0"), 1.5))
-            line_margin = 10
-            line_y = paper.y() + 9
-            for _ in range(3):
-                painter.drawLine(paper.x() + line_margin, line_y,
-                                  paper.right() - line_margin, line_y)
-                line_y += 6
-            painter.end()
-        else:
-            super().paintEvent(event)
-
     def wheelEvent(self, event):
         """滚轮：Ctrl=调透明度，普通=按灵敏度滚动（支持小数灵敏度）"""
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -1692,6 +1716,9 @@ class MoYuPdfViewer(QMainWindow):
 # ─────────────────────────────────────────────
 
 def main():
+    # macOS 上禁用原生菜单，确保自定义样式表生效
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
+    
     app = QApplication(sys.argv)
 
     font = QFont()
